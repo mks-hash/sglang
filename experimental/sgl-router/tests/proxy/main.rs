@@ -15,6 +15,7 @@ mod cache_aware_input_ids;
 mod chat_routing;
 mod external_indexer_routing;
 mod failover;
+mod generate_routing;
 mod graceful_shutdown;
 mod h2c_forward;
 mod header_forwarding;

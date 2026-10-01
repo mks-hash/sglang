@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Chat request validation, optional tokenization, and outgoing body preparation.
+//! Request validation, optional tokenization, and outgoing body preparation for
+//! chat completions and the native `/generate` endpoint.
 
 use crate::config::{ConflictPolicy, ParamSpec, SamplingField, SamplingOverrides};
 use crate::discovery::ModelId;
@@ -18,8 +19,13 @@ use serde_json::{json, Number, Value};
 /// SGLang upstream's coarse bytes-per-token estimate; only relative load ordering matters.
 const BYTES_PER_TOKEN_ESTIMATE: usize = 4;
 
+const CHAT_PATH: &str = "/v1/chat/completions";
+const GENERATE_PATH: &str = "/generate";
+
 /// Validated routing inputs and the original body, ready for worker selection.
-pub(super) struct PreparedChatRequest {
+pub(super) struct PreparedRequest {
+    /// Engine endpoint the request is forwarded to.
+    pub(super) path: &'static str,
     pub(super) model: ModelId,
     pub(super) streaming: bool,
     pub(super) max_output_tokens: Option<u64>,
@@ -29,13 +35,14 @@ pub(super) struct PreparedChatRequest {
     pub(super) input_token_count: usize,
     caller_set_rid: bool,
     fans_out: bool,
-    forwarding_scope: ForwardingScope,
+    /// `None` for `/generate`, which never carries router tokens and books no forwarding outcome.
+    forwarding_scope: Option<ForwardingScope>,
     parsed_body: Option<Value>,
     sampling_defaults: Vec<(SamplingField, Number)>,
 }
 
-impl PreparedChatRequest {
-    pub(super) fn prepare(
+impl PreparedRequest {
+    pub(super) fn chat(
         ctx: &AppContext,
         model: ModelId,
         fields: RoutingFields,
@@ -64,23 +71,56 @@ impl PreparedChatRequest {
         let tokens = parsed_body
             .as_ref()
             .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
-        // Keep load accounting available even when tokenization is unavailable.
-        let input_token_count = tokens
-            .as_ref()
-            .map(|tokens| tokens.ids.len().max(1))
-            .unwrap_or_else(|| estimate_prefill_tokens(&body));
         Ok(Self {
+            path: CHAT_PATH,
             model,
             streaming: fields.stream.unwrap_or(false),
             max_output_tokens: fields.requested_max_output_tokens(),
+            input_token_count: input_token_count(tokens.as_ref(), &body),
             body,
             tokens,
-            input_token_count,
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults),
-            forwarding_scope,
+            forwarding_scope: Some(forwarding_scope),
             parsed_body,
             sampling_defaults,
+        })
+    }
+
+    /// The prompt is `text` or `input_ids`, so routing tokens need no chat
+    /// template; the body is forwarded as sent apart from `rid` and PD bootstrap.
+    pub(super) fn generate(
+        ctx: &AppContext,
+        model: ModelId,
+        body: Bytes,
+        policy_needs_request_tokens: bool,
+    ) -> Result<Self, ApiError> {
+        let fields: GenerateFields =
+            serde_json::from_slice(&body).map_err(|_| invalid_request())?;
+        let needs_tokens = policy_needs_request_tokens || ctx.bucket_selector.is_enabled();
+        let parsed_body: Option<Value> = needs_tokens
+            .then(|| serde_json::from_slice(&body))
+            .transpose()
+            .map_err(|_| invalid_request())?;
+        // A batch (`text` list or nested `input_ids`) yields no tokens and routes on load.
+        let tokens = parsed_body
+            .as_ref()
+            .and_then(|parsed_body| request_tokens_for(&ctx.tokenizers, &model, parsed_body));
+        Ok(Self {
+            path: GENERATE_PATH,
+            model,
+            streaming: fields.stream.unwrap_or(false),
+            max_output_tokens: fields.max_new_tokens(),
+            input_token_count: input_token_count(tokens.as_ref(), &body),
+            body,
+            tokens,
+            caller_set_rid: fields.rid.is_some(),
+            // The engine suffixes a scalar `rid` per item for batches and `n > 1`,
+            // and the scheduler aborts by prefix, so a minted ID still covers them.
+            fans_out: false,
+            forwarding_scope: None,
+            parsed_body,
+            sampling_defaults: Vec::new(),
         })
     }
 
@@ -100,15 +140,13 @@ impl PreparedChatRequest {
         engine_rid: Option<&str>,
     ) -> Result<Bytes, ApiError> {
         // Routing tokens can replace engine tokenization only for supported chat templates.
-        let forwarding = input_ids_forwarding(
-            self.forwarding_scope,
-            self.parsed_body.as_ref(),
-            self.tokens.as_ref(),
-        );
+        let forwarding = self.forwarding_scope.map(|scope| {
+            input_ids_forwarding(scope, self.parsed_body.as_ref(), self.tokens.as_ref())
+        });
         let input_ids = self
             .tokens
             .as_ref()
-            .filter(|_| forwarding == InputIdsForwarding::Forwarded)
+            .filter(|_| forwarding == Some(InputIdsForwarding::Forwarded))
             .map(|tokens| tokens.ids.as_slice());
         let body = build_outgoing_body(
             &self.body,
@@ -120,12 +158,35 @@ impl PreparedChatRequest {
         )?;
         // Book only after the outgoing body exists; a request rejected here
         // (an f64-overflow literal re-parsed for PD bootstrap) was never dispatched.
-        ctx.metrics
-            .record_input_ids_forwarding(&self.model.0, forwarding);
-        if forwarding == InputIdsForwarding::TokenizeFailed {
-            ctx.metrics.record_ingress_tokenize_error(&self.model.0);
+        if let Some(forwarding) = forwarding {
+            ctx.metrics
+                .record_input_ids_forwarding(&self.model.0, forwarding);
+            if forwarding == InputIdsForwarding::TokenizeFailed {
+                ctx.metrics.record_ingress_tokenize_error(&self.model.0);
+            }
         }
         Ok(body)
+    }
+}
+
+/// The `/generate` fields routing reads; the engine validates the rest.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct GenerateFields {
+    stream: Option<bool>,
+    rid: Option<IgnoredAny>,
+    /// An object, or a list of them for a batch.
+    sampling_params: Value,
+}
+
+impl GenerateFields {
+    /// The largest `max_new_tokens` across a batch; `None` leaves the engine default.
+    fn max_new_tokens(&self) -> Option<u64> {
+        let max_new_tokens = |params: &Value| params.get("max_new_tokens")?.as_u64();
+        match &self.sampling_params {
+            Value::Array(batch) => batch.iter().filter_map(max_new_tokens).max(),
+            params => max_new_tokens(params),
+        }
     }
 }
 
@@ -416,6 +477,13 @@ fn requests_multiple_samples(
             .and_then(|(_, value)| value.as_f64())
             .is_some_and(|n| n > 1.0),
     }
+}
+
+/// Keep load accounting available even when tokenization is unavailable.
+fn input_token_count(tokens: Option<&RequestTokens>, body: &Bytes) -> usize {
+    tokens
+        .map(|tokens| tokens.ids.len().max(1))
+        .unwrap_or_else(|| estimate_prefill_tokens(body))
 }
 
 fn estimate_prefill_tokens(body: &Bytes) -> usize {
@@ -785,6 +853,38 @@ mod tests {
     fn bucket_routing_requests_tokens_even_for_a_non_token_policy() {
         assert!(should_tokenize_request(false, false, true));
         assert!(!should_tokenize_request(false, false, false));
+    }
+
+    #[test]
+    fn generate_max_new_tokens_reads_one_or_a_batch_of_sampling_params() {
+        for (sampling_params, expected) in [
+            (json!({"max_new_tokens": 8}), Some(8)),
+            (
+                json!([{"max_new_tokens": 8}, {"max_new_tokens": 32}, {}]),
+                Some(32),
+            ),
+            (Value::Null, None),
+        ] {
+            let fields = GenerateFields {
+                sampling_params,
+                ..Default::default()
+            };
+            assert_eq!(fields.max_new_tokens(), expected);
+        }
+    }
+
+    #[test]
+    fn generate_forwards_its_body_without_a_chat_forwarding_outcome() {
+        let ctx = AppContext::stub();
+        let body = Bytes::from_static(br#"{"text":"hi","sampling_params":{"temperature":0}}"#);
+        let request =
+            PreparedRequest::generate(&ctx, ModelId("stub-model".into()), body.clone(), false)
+                .unwrap();
+        assert_eq!(request.into_outgoing_body(&ctx, None, None).unwrap(), body);
+        assert!(!ctx
+            .metrics
+            .render()
+            .contains("sgl_router_input_ids_forwarding_total{"));
     }
 
     #[test]
